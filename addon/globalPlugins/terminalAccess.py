@@ -705,6 +705,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._reapplyAttemptsLeft = 0
 		self._reapplyEverResolved = False
 		self._cursorTrackingTimer = None
+		self._cursorFocusGeneration = 0
 		self._lastCaretPosition = None
 		self._lastTypedChar = None
 		self._repeatedCharCount = 0
@@ -786,6 +787,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		# Application profile management
 		self._profileManager = ProfileManager()
 		self._currentProfile = None
+		self._manualProfileSelection = None
 
 		# Lazy-start managers — initialized when terminal is bound
 		self._windowMonitor = None
@@ -900,6 +902,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		"""
 		if self.isTerminalApp(obj):
 			return True
+		self._resetTerminalInteractionState()
+		return False
+
+	def _resetTerminalInteractionState(self):
+		"""Discard typing, modal commands and caret state owned by the old focus."""
 		# Exit command layer silently when focus leaves terminal
 		if getattr(self, "_inCommandLayer", False):
 			self._exitCommandLayer()
@@ -909,10 +916,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		# Exit table mode silently when focus leaves terminal
 		if getattr(self, "_tableNavigator", None) is not None:
 			self._exitTableModeBindings()
-		return False
+		self._typedWordChars.clear()
+		self._lastTypedChar = None
+		self._repeatedCharCount = 0
+		self._cursorFocusGeneration += 1
+		if self._cursorTrackingTimer is not None:
+			self._cursorTrackingTimer.Stop()
+			self._cursorTrackingTimer = None
+		self._lastCaretPosition = None
+		self._lastLineText = None
+		self._lastLineStartOffset = None
+		self._lastLineEndOffset = None
+		self._lastLineGeneration = -1
 
 	def terminate(self):
 		"""Clean up when the plugin is terminated."""
+		self._cursorFocusGeneration += 1
+		if self._cursorTrackingTimer is not None:
+			self._cursorTrackingTimer.Stop()
+			self._cursorTrackingTimer = None
 		# Unregister from the terminal overlay so it stops delegating to a
 		# dead plugin instance after a reload.
 		try:
@@ -1126,6 +1148,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			appName = obj.appModule.appName
 		except (AttributeError, TypeError):
 			return
+		if self._boundTerminal is None or self._boundTerminal != obj:
+			self._resetTerminalInteractionState()
 		self._boundTerminal = obj
 		wasSearchJump = self._searchJumpPending
 		jumpPending = self._handleSearchJumpSuppression(obj)
@@ -1233,6 +1257,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def _detectAndApplyProfile(self, obj):
 		"""Detect and activate the appropriate application profile."""
+		selection = getattr(self, "_manualProfileSelection", None)
+		if selection is not None:
+			from controlTypes import Role
+			from NVDAObjects.behaviors import Terminal
+			terminal, app_name = selection
+			if obj == terminal:
+				profile = self._profileManager.get_profile(app_name)
+				if profile is not None:
+					self._currentProfile = profile
+					return
+			# Host-app dialogs also pass isTerminalApp's app-name fallback.
+			# Only another terminal control ends the manual selection.
+			if obj == terminal or isinstance(obj, Terminal) or obj.role == Role.TERMINAL:
+				self._manualProfileSelection = None
 		detectedApp = self._profileManager.detect_application(obj)
 		if detectedApp != 'default':
 			profile = self._profileManager.get_profile(detectedApp)
@@ -1525,25 +1563,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			pass
 
 	def _updateBrailleCaret(self, obj):
-		"""Tell the braille display that the caret moved.
+		"""Refresh braille after typing or a transient character message.
 
-		This must be called on every caret and typed-character event we
-		handle, BEFORE any speech-suppression early return.
-
-		The overlay never falls through to NVDA's native event_caret (that
-		would double-speak and announce "blank" after Enter), and NVDA's
-		braille caret tracking rides on that native handler. So if we do
-		not do this ourselves, nothing does: the display keeps showing
-		stale content until the user pans away and back, and it never
-		tethers to the cursor while typing. That was a shipped bug through
-		2.0.x, reported by a braille user.
-
-		Speech and braille are separate output channels. Deliberately not
-		gated on quiet mode or cursorTracking: those silence *speech*, and
-		a braille reader who turns them off still needs the display to
-		follow the cursor. Unlike _brailleMessage (a transient flash),
-		this moves the display's tether, which is what makes typed text
-		show up under the fingers.
+		The overlay preserves NVDAObject's guarded native caret hooks.
+		These additional updates keep typing and post-speech braille
+		tracking independent of the add-on's speech settings.
 		"""
 		try:
 			if braille.handler.displaySize > 0:
@@ -1569,18 +1593,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _handleTerminalCaret(self, obj):
 		"""Handle a caret movement event in a terminal.
 
-		Called from the overlay's event_caret. The overlay never falls
-		through to NVDA's native caret handling for terminals: our own
-		_announceCursorPosition does the speech with debouncing, blank
-		suppression, and error audio cues. In quiet mode nothing is spoken.
+		Called after the overlay preserves NVDA's non-speech caret hooks.
+		Our _announceCursorPosition handles the add-on's speech with
+		debouncing, blank suppression and error audio cues. Quiet mode
+		suppresses these announcements.
 		"""
 		isQuietMode = self._configManager.get("quietMode")
 
-		# Braille first, unconditionally: the overlay suppressed NVDA's
-		# native caret handling (and with it NVDA's braille tracking), so
-		# every early return below would otherwise leave the display
-		# stranded on stale content.
-		self._updateBrailleCaret(obj)
+		# The overlay has already run NVDAObject's non-speech caret hooks,
+		# including braille tracking, before these speech-only early returns.
 
 		# In quiet mode, do NOT call nextHandler (suppresses all speech).
 		# Only play audio cues if enabled.
@@ -1618,7 +1639,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 		# Schedule announcement with delay
 		self._cursorTrackingTimer = wx.CallLater(
-			self._configManager.get("cursorDelay", 20), self._announceCursorPosition, obj
+			self._configManager.get("cursorDelay", 20), self._announceCursorPosition,
+			obj, self._cursorFocusGeneration
 		)
 
 	def _handleTerminalTextChange(self, obj):
@@ -1729,13 +1751,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		tones.beep(600, 30)
 		tones.beep(800, 30)
 
-	def _announceCursorPosition(self, obj):
+	def _announceCursorPosition(self, obj, _focusGeneration=None):
 		"""
 		Announce the current cursor position based on the tracking mode.
 
 		Args:
 			obj: The terminal object.
 		"""
+		if _focusGeneration is not None and (
+			_focusGeneration != self._cursorFocusGeneration or self._boundTerminal != obj
+		):
+			return
 		# Re-check output grace: a textChange may have arrived after
 		# this callback was scheduled by wx.CallLater in event_caret.
 		if self._configManager.get("streamingSuppression", True):
@@ -1757,7 +1783,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			# missing attributes on obj or COM/UIA errors.
 			pass
 
-	def _announceStandardCursor(self, obj, _retry=False):
+	def _announceStandardCursor(self, obj, _retry=False, _focusGeneration=None):
 		"""
 		Standard cursor tracking - announce character at cursor position.
 
@@ -1770,6 +1796,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			_retry: If True, this is a deferred retry call; skip scheduling
 				further retries to prevent unbounded CallLater chains.
 		"""
+		if _focusGeneration is not None and (
+			_focusGeneration != self._cursorFocusGeneration or self._boundTerminal != obj
+		):
+			return
 		# Get the current caret position
 		info = obj.makeTextInfo(textInfos.POSITION_CARET)
 
@@ -1863,8 +1893,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			output_grace = (time.monotonic() - self._lastTextChangeTime) < self._OUTPUT_CARET_GRACE
 			if not _retry and not output_grace:
 				try:
-					wx.CallLater(50, self._announceStandardCursor, obj, True)
-					wx.CallLater(150, self._announceStandardCursor, obj, True)
+					wx.CallLater(50, self._announceStandardCursor, obj, True, self._cursorFocusGeneration)
+					wx.CallLater(150, self._announceStandardCursor, obj, True, self._cursorFocusGeneration)
 				except (RuntimeError, AttributeError):
 					pass
 			return
@@ -1873,9 +1903,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 		# Re-assert the braille tether after speaking: _speakCharacter can
 		# emit a transient braille message, and this puts the display back
-		# on the caret with its line context. (The unconditional update at
-		# the top of _handleTerminalCaret is what guarantees braille moves
-		# at all; this is the post-speech refresh.)
+		# on the caret with its line context. The overlay already performed
+		# the native caret update; this is the post-speech refresh.
 		self._updateBrailleCaret(obj)
 
 	# DEPRECATED: Scheduled for removal in v2.0
@@ -3060,11 +3089,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _showProfileSelectionDialog(self):
 		"""Open the profile selection dialog."""
 		from lib.profiles import ProfileSelectionDialog
+		# The dialog's focus event clears _boundTerminal before activation.
+		terminal = self._boundTerminal or api.getFocusObject()
 
 		def on_activate(app_name):
 			profile = self._profileManager.get_profile(app_name)
 			if profile:
 				self._currentProfile = profile
+				if terminal is not None:
+					self._manualProfileSelection = (terminal, app_name)
 				ui.message(_("Profile activated: {name}").format(name=profile.displayName))
 
 		def _show():
@@ -3380,6 +3413,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	#: matching NVDA's speech.PROTECTED_CHAR.
 	_PROTECTED_CHAR = "*"
 
+	def _clear_typing_echo_state(self):
+		"""Discard partial words and symbol runs without speaking them."""
+		self._typedWordChars = []
+		self._lastTypedChar = None
+		self._repeatedCharCount = 0
+
 	def _echoTypedWord(self, ch):
 		"""Accumulate typed characters and speak each completed word.
 
@@ -3393,6 +3432,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		speaking the "word" would read it aloud in full. The buffer is
 		discarded in that case rather than kept.
 		"""
+		if self._isTypingProtected():
+			self._clear_typing_echo_state()
+			return
 		if not self._getEffective("wordEcho"):
 			# Keep the buffer clean so enabling word echo mid-session does
 			# not speak a word half-collected while it was off.
