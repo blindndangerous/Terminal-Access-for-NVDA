@@ -6,6 +6,24 @@ The 2.3.0 entry below is the consolidated summary of everything that changed sin
 
 (There is no 2.2.0 entry: that version number was used during development but never released, and its changes are folded into 2.3.0.)
 
+## [Unreleased]
+
+### Fixed
+
+- Optional terminal key and word echo now retain NVDA's no-output suppression on terminals that support reliable text-change events. Unconfirmed input and partial words are discarded on Enter, navigation, focus loss and echo-owner changes; protected words are discarded before accumulation.
+- Cleaning a build preserves the maintained English Markdown guide. Incremental builds now include changes to library modules, and CI installs the build dependencies needed by the packaging tests.
+- Terminal caret changes preserve NVDA's review cursor, vision, braille-input and braille-display tracking without adding native selection speech. Output-only repaints refresh braille even in quiet mode.
+- A manually selected profile now survives focus returning from the profile dialog. It remains active until another terminal gains focus, when automatic detection resumes.
+- Completed searches with no matches now replace earlier results, including empty terminal buffers. Cancelled queries, invalid patterns, and failed reads preserve the previous search.
+- Refreshing search results preserves the selected section scope. Navigation reaches the correct occurrence when identical matching lines are adjacent, and case-insensitive Unicode matches retain source-text offsets.
+- Fuzzy fallback now checks single edits and adjacent transpositions in linear time per word and stops at the existing 1,000-result cap. Unicode words whose lowercase form expands are compared correctly.
+- Switching terminal controls clears unfinished typing echo and exits table, copy and command modes. Delayed cursor announcements from the old focus are discarded.
+
+### Tests
+
+- Cover command privacy gates, transcript export, semantic navigation, summaries, code blocks, and settings persistence.
+- Build the add-on before CI package checks and enforce the existing 70% coverage requirement on Python 3.11 and 3.13.
+
 ## [2.3.0] - 2026-07-17
 
 Everything below is the change from 2.0.3. The headlines: a new way to read the whole terminal as a document, terminals the add-on used to ignore now work, find reaches the scrollback on older consoles, braille follows the cursor again, and Key Echo no longer needs NVDA's own settings turned off. Existing settings are preserved on upgrade.
